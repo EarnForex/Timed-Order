@@ -1,11 +1,11 @@
 ﻿//+------------------------------------------------------------------+
 //|                                                      Timed Order |
-//|                                  Copyright © 2022, EarnForex.com |
+//|                                  Copyright © 2023, EarnForex.com |
 //|                                       https://www.earnforex.com/ |
 //+------------------------------------------------------------------+
-#property copyright "Copyright © 2022, EarnForex"
+#property copyright "Copyright © 2023, EarnForex"
 #property link      "https://www.earnforex.com/metatrader-expert-advisors/TimedOrder/"
-#property version   "1.00"
+#property version   "1.001"
 #property strict
 
 #include <stdlib.mqh>
@@ -89,7 +89,6 @@ int last_error;
 string ProfitCurrency = "", account_currency = "", BaseCurrency = "", ReferenceSymbol = NULL, AdditionalReferenceSymbol = NULL;
 bool ReferenceSymbolMode, AdditionalReferenceSymbolMode;
 int ProfitCalcMode;
-double TickSize;
 
 // For error logging:
 string filename;
@@ -386,6 +385,8 @@ double GetPositionSize(double entry, double stoploss)
         UnitCost *= (current_rate / future_rate);
     }
 
+    double TickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+    
     if ((SL != 0) && (UnitCost != 0) && (TickSize != 0)) PositionSize = NormalizeDouble(RiskMoney / (SL * UnitCost / TickSize), LotStep_digits);
 
     if (PositionSize < MarketInfo(Symbol(), MODE_MINLOT)) PositionSize = MarketInfo(Symbol(), MODE_MINLOT);
