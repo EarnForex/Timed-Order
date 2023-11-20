@@ -1,10 +1,11 @@
 // -------------------------------------------------------------------------------
-//   Opens a trade (market or pending order) at specified time.
-//   
-//   As of 2022-09-23, Stop Limit orders in cTrader don't make much sense, so they aren't implemented in this EA.
+//   Opens a trade (market or pending order) at the specified time.
+//   One-time or daily.
 //
-//   Version 1.00.
-//   Copyright 2022, EarnForex.com
+//   As of 2023-11-20, Stop Limit orders in cTrader don't make much sense, so they aren't implemented in this EA.
+//
+//   Version 1.01.
+//   Copyright 2023, EarnForex.com
 //   https://www.earnforex.com/metatrader-expert-advisors/TimedOrder/
 // -------------------------------------------------------------------------------
 
@@ -68,11 +69,17 @@ namespace cAlgo
         [Parameter(DefaultValue = 0, MinValue = 0, MaxValue = 59)]
         public int Minute { get; set; }
 
+        [Parameter(DefaultValue = 0, MinValue = 0, MaxValue = 59)]
+        public int Second { get; set; }
+
         [Parameter("Order type", DefaultValue = ENUM_BETTER_ORDER_TYPE.Buy)]
         public ENUM_BETTER_ORDER_TYPE OrderType { get; set; }
 
-        [Parameter("Entry price (optional unless pending)", DefaultValue = 0, MinValue = 0)]
+        [Parameter("Entry price (optional)", DefaultValue = 0, MinValue = 0)]
         public double Entry { get; set; }
+
+        [Parameter("Entry distance in points (for pending)", DefaultValue = 0, MinValue = 0)]
+        public int EntryDistancePoints { get; set; }
 
         [Parameter("Stop-loss type", DefaultValue = ENUM_SLTP_TYPE.Price_Level)]
         public ENUM_SLTP_TYPE SLType { get; set; }
@@ -108,6 +115,9 @@ namespace cAlgo
         [Parameter(DefaultValue = 0, MinValue = 0, MaxValue = 59)]
         public int MinuteExp { get; set; }
         
+        [Parameter(DefaultValue = 0, MinValue = 0, MaxValue = 59)]
+        public int SecondExp { get; set; }
+
         [Parameter("How many times to try sending order before failure?", DefaultValue = 10, MinValue = 1)]
         public int Retries { get; set; }
 
@@ -116,6 +126,9 @@ namespace cAlgo
 
         [Parameter("Maximum spread in points", DefaultValue = 30, MinValue = 0)]
         public int MaxSpread { get; set; }
+
+        [Parameter("Retry until spread falls below MaxSpread?", DefaultValue = false)]
+        public bool RetryUntilMaxSpread { get; set; }
 
         [Parameter(DefaultValue = 1, MinValue = 0)]
         public int Slippage { get; set; }
@@ -127,9 +140,45 @@ namespace cAlgo
         public int ATR_Period { get; set; }
         
 
+        [Parameter("=== Daily mode", DefaultValue = "=================")]
+        public string DailyModeInputs { get; set; }
+
+        [Parameter("Daily mode: if true, will trade every given day.", DefaultValue = false)]
+        public bool DailyMode { get; set; }
+
+        [Parameter(DefaultValue = 0, MinValue = 0, MaxValue = 23)]
+        public int DailyHour { get; set; }
+
+        [Parameter(DefaultValue = 0, MinValue = 0, MaxValue = 59)]
+        public int DailyMinute { get; set; }
+
+        [Parameter(DefaultValue = 0, MinValue = 0, MaxValue = 59)]
+        public int DailySecond { get; set; }
+
+        [Parameter(DefaultValue = true)]
+        public bool Monday { get; set; }
+        
+        [Parameter(DefaultValue = true)]
+        public bool Tuesday { get; set; }
+
+        [Parameter(DefaultValue = true)]
+        public bool Wednesday { get; set; }
+
+        [Parameter(DefaultValue = true)]
+        public bool Thursday { get; set; }
+
+        [Parameter(DefaultValue = true)]
+        public bool Friday { get; set; }
+
+        [Parameter(DefaultValue = false)]
+        public bool Saturday { get; set; }
+
+        [Parameter(DefaultValue = false)]
+        public bool Sunday { get; set; }
+
         [Parameter("=== Position sizing", DefaultValue = "=================")]
         public string PositionSizing { get; set; }
-        
+
         [Parameter("CalculatePositionSize: Use money management module?", DefaultValue = false)]
         public bool CalculatePositionSize { get; set; }
 
@@ -194,18 +243,19 @@ namespace cAlgo
         private bool CanWork = false;
         private bool WillNoLongerTryOpeningTrade = false;
         private string PostOrderText = "";
+        private bool[] EnabledDays; // For Daily Mode.
         
         protected override void OnStart()
         {
-            trade_time = new DateTime(Year, Month, Day, Hour, Minute, 0);
-            expires_time = new DateTime(YearExp, MonthExp, DayExp, HourExp, MinuteExp, 0);
+            trade_time = new DateTime(Year, Month, Day, Hour, Minute, Second);
+            expires_time = new DateTime(YearExp, MonthExp, DayExp, HourExp, MinuteExp, SecondExp);
             unix_epoch = new DateTime(1970, 1, 1, 0, 0, 0);
 
             string Error = CheckInputParameters();
             if (Error != "")
             {
                 if (!Silent) Chart.DrawStaticText("TimedOrder", "Wrong input parameters!\n" + Error, CornerVertical, CornerHorizontal, Color.Red);
-                Print("Wrong input parambers! " + Error);
+                Print("Wrong input parameters! " + Error);
                 CanWork = false;
                 return;
             }
@@ -220,22 +270,22 @@ namespace cAlgo
                 tf_data = MarketData.GetBars(ATR_Timeframe);
                 ATR = Indicators.AverageTrueRange(tf_data, ATR_Period, MovingAverageType.Simple);
             }
-
+            
+            EnabledDays = new bool[7];
+            EnabledDays[0] = Sunday;
+            EnabledDays[1] = Monday;
+            EnabledDays[2] = Tuesday;
+            EnabledDays[3] = Wednesday;
+            EnabledDays[4] = Thursday;
+            EnabledDays[5] = Friday;
+            EnabledDays[6] = Saturday;
+            
             // For smooth updates.
             Timer.Start(TimeSpan.FromMilliseconds(100));
 
             CanWork = true;
             WillNoLongerTryOpeningTrade = false;
         }
-
-//+------------------------------------------------------------------+
-//| Stops timer if needed.                                           |
-//+------------------------------------------------------------------+
-        /*protected override void OnStop()
-        {
-                Timer.Stop();
-            }
-        }*/
 
 //+------------------------------------------------------------------+
 //| Updates text about time left to news or passed after news.       |
@@ -259,11 +309,15 @@ namespace cAlgo
 //+------------------------------------------------------------------+
         private void DoTrading()
         {
+            DateTime order_time = trade_time;
+            if (DailyMode) order_time = GetOrderTimeForDailyMode();
+
             // Do nothing if it is too early.
             TimeSpan difference;
-            if (TimeType == ENUM_TIME_TYPE.Server) difference = Time.Subtract(trade_time);
-            else difference = DateTime.Now.Subtract(trade_time);
+            if (TimeType == ENUM_TIME_TYPE.Server) difference = Time.Subtract(order_time);
+            else difference = DateTime.Now.Subtract(order_time);
             if (difference <= TimeSpan.FromMilliseconds(0)) return;
+            
         
             double SL, TP;
             if (SLType == ENUM_SLTP_TYPE.ATR) SL = ATR.Result.LastValue * StopLoss;
@@ -276,7 +330,7 @@ namespace cAlgo
             else if (TPType == ENUM_SLTP_TYPE.Distance) TP = TakeProfit * Symbol.TickSize;
             else TP = TakeProfit; // Level.
         
-            // Time is due. At this point, if somethign fails, the EA won't try again until it is reloaded.
+            // Time is due. At this point, if something fails, the EA won't try again until it is reloaded.
             WillNoLongerTryOpeningTrade = true;
         
             // Prevent position opening when the spread is too wide (greater than MaxSpread input).
@@ -284,7 +338,13 @@ namespace cAlgo
             if ((MaxSpread > 0) && (spread / Symbol.TickSize > MaxSpread))
             {
                 string explanation = "Current spread " + (spread / Symbol.TickSize).ToString() + " > maximum spread " + MaxSpread.ToString() + ". Not opening the trade.";
+                if (RetryUntilMaxSpread) explanation += " Waiting for spread to go below the MaxSpread setting.";
                 Print(explanation);
+                if (RetryUntilMaxSpread)
+                {
+                    WillNoLongerTryOpeningTrade = false; // Let it try again.
+                    return;
+                }
                 if (AlertsOnFailure)
                 {
                     string Text = Symbol.Name + " @ " + TimeFrame.Name + " - " + OrderType.ToString() + ". " + explanation;
@@ -324,16 +384,26 @@ namespace cAlgo
             {
                 // Modify trade type based on the current price.
                 double price = Symbol.Ask;
+                double entry = Entry;
                 if ((OrderType == ENUM_BETTER_ORDER_TYPE.Sell_Stop) || (OrderType == ENUM_BETTER_ORDER_TYPE.Sell_Limit)) price = Symbol.Bid;
-                if ((OrderType == ENUM_BETTER_ORDER_TYPE.Buy_Stop) && (Entry < price)) order_type = ENUM_BETTER_ORDER_TYPE.Buy_Limit;
-                else if ((OrderType == ENUM_BETTER_ORDER_TYPE.Buy_Limit) && (Entry > price)) order_type = ENUM_BETTER_ORDER_TYPE.Buy_Stop;
-                else if ((OrderType == ENUM_BETTER_ORDER_TYPE.Sell_Stop) && (Entry > price)) order_type = ENUM_BETTER_ORDER_TYPE.Sell_Limit;
-                else if ((OrderType == ENUM_BETTER_ORDER_TYPE.Sell_Limit) && (Entry < price)) order_type = ENUM_BETTER_ORDER_TYPE.Sell_Stop;
-                
-                if ((SLType == ENUM_SLTP_TYPE.Price_Level) && (SL != 0)) SL = Math.Abs(Entry - SL);
-                if ((TPType == ENUM_SLTP_TYPE.Price_Level) && (TP != 0)) TP = Math.Abs(Entry - TP);
 
-                tr = CreatePendingOrder(order_type, GetPositionSize(SL / Symbol.PipSize), Entry, SL / Symbol.PipSize, TP / Symbol.PipSize);
+                if (EntryDistancePoints > 0)
+                {
+                    // order_type remains being equal TradeType.
+                    if ((order_type == ENUM_BETTER_ORDER_TYPE.Buy_Stop) || (order_type == ENUM_BETTER_ORDER_TYPE.Sell_Limit)) entry = price + EntryDistancePoints * Symbol.TickSize;
+                    else if ((order_type == ENUM_BETTER_ORDER_TYPE.Sell_Stop) || (order_type == ENUM_BETTER_ORDER_TYPE.Buy_Limit)) entry = price - EntryDistancePoints * Symbol.TickSize;
+                }
+                else
+                {
+                    if ((OrderType == ENUM_BETTER_ORDER_TYPE.Buy_Stop) && (Entry < price)) order_type = ENUM_BETTER_ORDER_TYPE.Buy_Limit;
+                    else if ((OrderType == ENUM_BETTER_ORDER_TYPE.Buy_Limit) && (Entry > price)) order_type = ENUM_BETTER_ORDER_TYPE.Buy_Stop;
+                    else if ((OrderType == ENUM_BETTER_ORDER_TYPE.Sell_Stop) && (Entry > price)) order_type = ENUM_BETTER_ORDER_TYPE.Sell_Limit;
+                    else if ((OrderType == ENUM_BETTER_ORDER_TYPE.Sell_Limit) && (Entry < price)) order_type = ENUM_BETTER_ORDER_TYPE.Sell_Stop;
+                }                
+                if ((SLType == ENUM_SLTP_TYPE.Price_Level) && (SL != 0)) SL = Math.Abs(entry - SL);
+                if ((TPType == ENUM_SLTP_TYPE.Price_Level) && (TP != 0)) TP = Math.Abs(entry - TP);
+
+                tr = CreatePendingOrder(order_type, GetPositionSize(SL / Symbol.PipSize), entry, SL / Symbol.PipSize, TP / Symbol.PipSize);
         
                 PostOrderText = Symbol.VolumeInUnitsToQuantity(tr.PendingOrder.VolumeInUnits).ToString() + " lots; Open = " + tr.PendingOrder.TargetPrice.ToString();
                 if (SL != 0) PostOrderText += " SL = " + tr.PendingOrder.StopLoss.ToString();
@@ -478,7 +548,8 @@ namespace cAlgo
 //+------------------------------------------------------------------+
 //| Calculate position size depending on money management parameters.|
 //+------------------------------------------------------------------+
-        double GetPositionSize(double SL)
+        double GetPositionSize
+        (double SL)
         {
             if (!CalculatePositionSize)
                 return (Symbol.QuantityToVolumeInUnits(FixedPositionSize));
@@ -536,14 +607,20 @@ namespace cAlgo
 // Checks whether input parameters make sense and returns error if they don't.
         string CheckInputParameters()
         {
-            // Order time has already passed.
-            if (((TimeType == ENUM_TIME_TYPE.Server) && (trade_time <= Time)) || ((TimeType == ENUM_TIME_TYPE.Local) && (trade_time <= DateTime.Now))) return "Order time has already passed.";
-            
+            if (!DailyMode) // Normal mode (one-time fixed-date trade).
+            {
+                // Order time has already passed.
+                if (((TimeType == ENUM_TIME_TYPE.Server) && (trade_time <= Time)) || ((TimeType == ENUM_TIME_TYPE.Local) && (trade_time <= DateTime.Now))) return "Order time has already passed.";
+            }
+            else // Daily mode (trades every set day at a given time).
+            {
+                if ((!Monday) && (!Tuesday) && (!Wednesday) && (!Thursday) && (!Friday) && (!Saturday) && (!Sunday)) return "At least one day of the week should be selected.";
+            }
             // Pending order with zero entry.
-            if ((OrderType != ENUM_BETTER_ORDER_TYPE.Buy) && (OrderType != ENUM_BETTER_ORDER_TYPE.Sell) && (Entry == 0)) return "Entry price cannot be zero for pending orders.";
+            if ((OrderType != ENUM_BETTER_ORDER_TYPE.Buy) && (OrderType != ENUM_BETTER_ORDER_TYPE.Sell) && (Entry == 0) && (EntryDistancePoints <= 0)) return "Entry price and distance cannot be both zero for pending orders.";
            
             // SL on the wrong side.
-            if ((StopLoss != 0) && (SLType == ENUM_SLTP_TYPE.Price_Level))
+            if ((StopLoss != 0) && (SLType == ENUM_SLTP_TYPE.Price_Level) && (EntryDistancePoints <= 0))
             {
                 if (StopLoss >= Entry)
                 {
@@ -556,7 +633,7 @@ namespace cAlgo
                     if (OrderType == ENUM_BETTER_ORDER_TYPE.Sell_Limit) return "Stop-loss cannot be below entry for a Sell Limit.";
                 }
             }
-            if ((TakeProfit != 0) && (TPType == ENUM_SLTP_TYPE.Price_Level))
+            if ((TakeProfit != 0) && (TPType == ENUM_SLTP_TYPE.Price_Level) && (EntryDistancePoints <= 0))
             {
                 if (TakeProfit <= Entry)
                 {
@@ -599,10 +676,14 @@ namespace cAlgo
         
             s += OrderToString(OrderType);
         
-            if ((OrderType == ENUM_BETTER_ORDER_TYPE.Buy_Stop) || (OrderType == ENUM_BETTER_ORDER_TYPE.Buy_Limit) || (OrderType == ENUM_BETTER_ORDER_TYPE.Sell_Stop) || (OrderType == ENUM_BETTER_ORDER_TYPE.Sell_Limit)) s += " @ " + Entry.ToString();
+            if ((OrderType == ENUM_BETTER_ORDER_TYPE.Buy_Stop) || (OrderType == ENUM_BETTER_ORDER_TYPE.Buy_Limit) || (OrderType == ENUM_BETTER_ORDER_TYPE.Sell_Stop) || (OrderType == ENUM_BETTER_ORDER_TYPE.Sell_Limit))
+            {
+                if (EntryDistancePoints <= 0) s += " @ " + Entry.ToString();
+                else s += " @ " + EntryDistancePoints.ToString() + " pts.";
+            }
             
             if (failure) s += "\nExecution failed!";
-            if (trade_done) // Order already executed or tried to execute.
+            if ((!DailyMode) && (trade_done)) // Order already executed or tried to execute.
             {
                 if (!failure)
                 {
@@ -640,14 +721,25 @@ namespace cAlgo
         
             s += "\n";
             
+            DateTime order_time = trade_time;
+            if (DailyMode) order_time = GetOrderTimeForDailyMode();
+
             TimeSpan difference;
-            if (TimeType == ENUM_TIME_TYPE.Server) difference = Time.Subtract(trade_time);
-            else difference = DateTime.Now.Subtract(trade_time);
+            if (TimeType == ENUM_TIME_TYPE.Server) difference = Time.Subtract(order_time);
+            else difference = DateTime.Now.Subtract(order_time);
 
             if (difference <= TimeSpan.FromMilliseconds(0))
-                s += "Time to order:" + TimeDistance(difference.Negate()) + ".";
+                s += "Time to order:" + TimeDistance(difference.Negate());
             else
-                s += "Time after order:" + TimeDistance(difference) + ".";
+                s += "Time after order:" + TimeDistance(difference);
+            
+            if (DailyMode)
+            {
+                if (difference < -TimeSpan.FromSeconds(10)) WillNoLongerTryOpeningTrade = false; // Reset for further order taking.
+                s += " (daily mode)";
+            }
+            s += ".";
+
             Chart.DrawStaticText("TimedOrder", s, CornerVertical, CornerHorizontal, Color.Red);
         }
         
@@ -660,6 +752,30 @@ namespace cAlgo
             if (ot == ENUM_BETTER_ORDER_TYPE.Sell_Limit) return "Sell Limit";
             if (ot == ENUM_BETTER_ORDER_TYPE.Sell_Stop) return "Sell Stop";
             return "";
+        }
+        
+        DateTime GetOrderTimeForDailyMode()
+        {
+            bool skip_current_day = false;
+
+            DateTime current_time = DateTime.Now;
+            if (TimeType == ENUM_TIME_TYPE.Server) current_time = Time;
+            
+            DateTime target_time = new DateTime(current_time.Year, current_time.Month, current_time.Day, DailyHour, DailyMinute, DailySecond); // It's important to get the target time of the appropriate day (local/server).
+
+            TimeSpan difference = current_time.Subtract(target_time);
+            if (difference > TimeSpan.FromSeconds(10)) skip_current_day = true; // Skip the current day. Give a 10 seconds buffer.
+            // Find the next enabled day:
+            for (int i = 0; i <= 7; i++, target_time = target_time.AddDays(1)) // <= because the next day could be the same day of the week.
+            {
+                if ((i == 0) && (skip_current_day))
+                {
+                    continue;
+                }
+                if (EnabledDays[(int)target_time.DayOfWeek]) break;
+            }
+        
+            return target_time;
         }
     }
 }

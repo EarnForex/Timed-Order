@@ -5,12 +5,13 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright © 2023, EarnForex"
 #property link      "https://www.earnforex.com/metatrader-expert-advisors/TimedOrder/"
-#property version   "1.001"
+#property version   "1.01"
 #property strict
 
 #include <stdlib.mqh>
 
-#property description "Opens a trade (market or pending order) at specified time."
+#property description "Opens a trade (market or pending order) at the specified time."
+#property description "One-time or daily."
 
 enum ENUM_SLTP_TYPE
 {
@@ -37,12 +38,11 @@ enum ENUM_BETTER_ORDER_TYPE
     BETTER_ORDER_TYPE_SELLSTOP // Sell Stop
 };
 
-// Change trade type to new enum to define only Buy, Sell, and four pendings.
-
 input group "Trading"
 input datetime OrderTime = __DATETIME__; // Date/time (server) to open order
 input ENUM_BETTER_ORDER_TYPE OrderType = BETTER_ORDER_TYPE_BUY; // Order type
-input double Entry = 0; // Entry price (optional unless pending)
+input double Entry = 0; // Entry price (optional)
+input int EntryDistancePoints = 0; // Entry distance in points (for pending)
 input ENUM_SLTP_TYPE SLType = SLTP_TYPE_PRICELEVEL; // Stop-loss type
 input double StopLoss = 0;
 input ENUM_SLTP_TYPE TPType = SLTP_TYPE_PRICELEVEL; // Take-profit type
@@ -53,9 +53,20 @@ input datetime Expires = 0; // Expires on (if pending)
 input int Retries = 10; // How many times to try sending order before failure?
 input int MaxDifference = 0; // Max difference between given price and market price (points)
 input int MaxSpread = 3; // Maximum spread in points
+input bool RetryUntilMaxSpread = false; // Retry until spread falls below MaxSpread?
 input int Slippage = 30; // Maximum slippage in points
 input ENUM_TIMEFRAMES ATR_Timeframe = PERIOD_CURRENT; // ATR Timeframe
 input int ATR_Period = 14; // ATR Period
+input group "Daily mode"
+input bool DailyMode = false; // Daily mode: if true, will trade every given day.
+input string DailyTime = "18:34:00"; // Time for daily trades in HH:MM:SS format.
+input bool Monday = true;
+input bool Tuesday = true;
+input bool Wednesday = true;
+input bool Thursday = true;
+input bool Friday = true;
+input bool Saturday = false;
+input bool Sunday = false;
 input group "Position sizing"
 input bool CalculatePositionSize = false; // CalculatePositionSize: Use money management module?
 input double FixedPositionSize = 0.01; // FixedPositionSize: Used if CalculatePositionSize = false.
@@ -84,6 +95,7 @@ string PostOrderText;
 int global_ticket = 0;
 ENUM_ORDER_TYPE TradeType;
 int last_error;
+bool EnabledDays[7]; // For Daily Mode.
 
 // For tick value adjustment:
 string ProfitCurrency = "", account_currency = "", BaseCurrency = "", ReferenceSymbol = NULL, AdditionalReferenceSymbol = NULL;
@@ -112,11 +124,19 @@ int OnInit()
     if (Error != "")
     {
         if (!Silent) Comment("Wrong input parameters!\n" + Error);
-        Output("Wrong input parambers! " + Error);
+        Output("Wrong input parameters! " + Error);
         CanWork = false;
         return INIT_SUCCEEDED;
         //return INIT_FAILED; // Bad idea because it will wipe all the input parameters entered by the users.
     }
+    
+    EnabledDays[0] = Sunday;
+    EnabledDays[1] = Monday;
+    EnabledDays[2] = Tuesday;
+    EnabledDays[3] = Wednesday;
+    EnabledDays[4] = Thursday;
+    EnabledDays[5] = Friday;
+    EnabledDays[6] = Saturday;
     
     EventSetMillisecondTimer(100);
     
@@ -447,12 +467,15 @@ void DoTrading()
     }
 
     // Do nothing if it is too early.
-    datetime time;
-    if (TimeType == TIME_TYPE_SERVER) time = TimeCurrent();
-    else time = TimeLocal();
-    if (time < OrderTime) return;
+    datetime current_time;
+    if (TimeType == TIME_TYPE_SERVER) current_time = TimeCurrent();
+    else current_time = TimeLocal();
 
-    // Time is due. At this point, if somethign fails, the EA won't try again until it is reloaded.
+    datetime order_time = OrderTime;
+    if (DailyMode) order_time = GetOrderTimeForDailyMode(current_time);
+    if (current_time < order_time) return;
+
+    // Time is due. At this point, if something fails, the EA won't try again until it is reloaded.
     WillNoLongerTryOpeningTrade = true;
 
     double SL = 0, TP = 0;
@@ -472,7 +495,14 @@ void DoTrading()
     if ((MaxSpread > 0) && (spread > MaxSpread))
     {
         string explanation = "Current spread " + IntegerToString(spread) + " > maximum spread " + IntegerToString(MaxSpread) + ". Not opening the trade.";
+        if (RetryUntilMaxSpread) explanation += " Waiting for spread to go below the MaxSpread setting.";
         Output(explanation);
+        if (RetryUntilMaxSpread)
+        {
+            WillNoLongerTryOpeningTrade = false; // Let it try again.
+            return;
+        }
+        
         if (AlertsOnFailure)
         {
             string Text;
@@ -524,25 +554,35 @@ void DoTrading()
     {
         // Modify trade type based on the current price.
         double price = SymbolInfoDouble(Symbol(), SYMBOL_ASK);
+        double entry = Entry;
         if ((TradeType == OP_SELLSTOP) || (TradeType == OP_SELLLIMIT)) price = SymbolInfoDouble(Symbol(), SYMBOL_BID);
-        if ((TradeType == OP_BUYSTOP) && (Entry < price)) order_type = OP_BUYLIMIT;
-        else if ((TradeType == OP_BUYLIMIT) && (Entry > price)) order_type = OP_BUYSTOP;
-        else if ((TradeType == OP_SELLSTOP) && (Entry > price)) order_type = OP_SELLLIMIT;
-        else if ((TradeType == OP_SELLLIMIT) && (Entry < price)) order_type = OP_SELLSTOP;
-        
+        if (EntryDistancePoints > 0)
+        {
+            // order_type remains being equal TradeType.
+            if ((order_type == OP_BUYSTOP) || (order_type == OP_SELLLIMIT)) entry = price + EntryDistancePoints * _Point;
+            else if ((order_type == OP_SELLSTOP) || (order_type == OP_BUYLIMIT)) entry = price - EntryDistancePoints * _Point;
+        }
+        else
+        {
+            if ((TradeType == OP_BUYSTOP) && (Entry < price)) order_type = OP_BUYLIMIT;
+            else if ((TradeType == OP_BUYLIMIT) && (Entry > price)) order_type = OP_BUYSTOP;
+            else if ((TradeType == OP_SELLSTOP) && (Entry > price)) order_type = OP_SELLLIMIT;
+            else if ((TradeType == OP_SELLLIMIT) && (Entry < price)) order_type = OP_SELLSTOP;
+        }
+                
         if ((SLType != SLTP_TYPE_PRICELEVEL) && (SL != 0))
         {
             // Get SL as price level.
-            if ((order_type == OP_BUYSTOP) || (order_type == OP_BUYLIMIT)) SL = Entry - SL;
-            else if ((order_type == OP_SELLSTOP) || (order_type == OP_SELLLIMIT)) SL = Entry + SL;
+            if ((order_type == OP_BUYSTOP) || (order_type == OP_BUYLIMIT)) SL = entry - SL;
+            else if ((order_type == OP_SELLSTOP) || (order_type == OP_SELLLIMIT)) SL = entry + SL;
         }
         if ((TPType != SLTP_TYPE_PRICELEVEL) && (TP != 0))
         {
             // Get TP as price level.
-            if ((order_type == OP_BUYSTOP) || (order_type == OP_BUYLIMIT)) TP = Entry + TP;
-            else if ((order_type == OP_SELLSTOP) || (order_type == OP_SELLLIMIT)) TP = Entry - TP;
+            if ((order_type == OP_BUYSTOP) || (order_type == OP_BUYLIMIT)) TP = entry + TP;
+            else if ((order_type == OP_SELLSTOP) || (order_type == OP_SELLLIMIT)) TP = entry - TP;
         }
-        ticket = CreatePendingOrder(order_type, GetPositionSize(Entry, SL), Entry, SL, TP);
+        ticket = CreatePendingOrder(order_type, GetPositionSize(entry, SL), entry, SL, TP);
     }
 
     if (ticket > 0)
@@ -658,15 +698,24 @@ int CreatePendingOrder(const int order_type, const double volume, const double p
 // Checks whether input parameters make sense and returns error if they don't.
 string CheckInputParameters()
 {
-    // Order time has already passed.
-    if (((TimeType == TIME_TYPE_SERVER) && (OrderTime <= TimeCurrent())) ||
-        ((TimeType == TIME_TYPE_LOCAL) && (OrderTime <= TimeLocal()))) return "Order time has already passed.";
+    if (!DailyMode) // Normal mode (one-time fixed-date trade).
+    {
+        // Order time has already passed.
+        if (((TimeType == TIME_TYPE_SERVER) && (OrderTime <= TimeCurrent())) ||
+            ((TimeType == TIME_TYPE_LOCAL) && (OrderTime <= TimeLocal()))) return "Order time has already passed.";
     
+    }
+    else // Daily mode (trades every set day at a given time).
+    {
+        if (!CheckTime(DailyTime)) return "DailyTime should be in correct HH:MM:SS format.";
+        if ((!Monday) && (!Tuesday) && (!Wednesday) && (!Thursday) && (!Friday) && (!Saturday) && (!Sunday)) return "At least one day of the week should be selected.";
+    }
+
     // Pending order with zero entry.
-    if ((TradeType != OP_BUY) && (TradeType != OP_SELL) && (Entry == 0)) return "Entry price cannot be zero for pending orders.";
-    
+    if ((TradeType != OP_BUY) && (TradeType != OP_SELL) && (Entry == 0) && (EntryDistancePoints <= 0)) return "Entry price and distance cannot be both zero for pending orders.";
+
     // SL on the wrong side.
-    if ((StopLoss != 0) && (SLType == SLTP_TYPE_PRICELEVEL))
+    if ((StopLoss != 0) && (SLType == SLTP_TYPE_PRICELEVEL) && (EntryDistancePoints <= 0))
     {
         if (StopLoss >= Entry)
         {
@@ -679,7 +728,7 @@ string CheckInputParameters()
             if (TradeType == OP_SELLLIMIT) return "Stop-loss cannot be below entry for a Sell Limit.";
         }
     }
-    if ((TakeProfit != 0) && (TPType == SLTP_TYPE_PRICELEVEL))
+    if ((TakeProfit != 0) && (TPType == SLTP_TYPE_PRICELEVEL) && (EntryDistancePoints <= 0))
     {
         if (TakeProfit <= Entry)
         {
@@ -739,9 +788,13 @@ void ShowStatus()
 
     s += OrderToString(TradeType);
 
-    if ((TradeType == OP_BUYSTOP) || (TradeType == OP_BUYLIMIT) || (TradeType == OP_SELLSTOP) || (TradeType == OP_SELLLIMIT)) s += " @ " + DoubleToString(Entry, _Digits);
+    if ((TradeType == OP_BUYSTOP) || (TradeType == OP_BUYLIMIT) || (TradeType == OP_SELLSTOP) || (TradeType == OP_SELLLIMIT))
+    {
+        if (EntryDistancePoints <= 0) s += " @ " + DoubleToString(Entry, _Digits);
+        else s += " @ " + IntegerToString(EntryDistancePoints) + " pts.";
+    }
     
-    if (global_ticket != 0) // Order already executed or tried to execute.
+    if ((!DailyMode) && (global_ticket != 0)) // Order already executed or tried to execute.
     {
         s += "\n";
     
@@ -781,12 +834,23 @@ void ShowStatus()
 
     s += "\n";
     
-    datetime time;
-    if (TimeType == TIME_TYPE_SERVER) time = TimeCurrent();
-    else time = TimeLocal();
-    int difference = (int)time - (int)OrderTime;
-    if (difference <= 0) s += "Time to order: " + TimeDistance(-difference) + ".";
-    else s += "Time after order: " + TimeDistance(difference) + ".";
+    datetime current_time;
+    if (TimeType == TIME_TYPE_SERVER) current_time = TimeCurrent();
+    else current_time = TimeLocal();
+    
+    datetime order_time = OrderTime;
+    if (DailyMode) order_time = GetOrderTimeForDailyMode(current_time);
+    
+    int difference = (int)current_time - (int)order_time;
+    
+    if (difference <= 0) s += "Time to order: " + TimeDistance(-difference);
+    else s += "Time after order: " + TimeDistance(difference);
+    if (DailyMode)
+    {
+        if (difference < -10) WillNoLongerTryOpeningTrade = false; // Reset for further order taking.
+        s += " (daily mode)";
+    }
+    s += ".";
 
     Comment(s);
 }
@@ -845,5 +909,56 @@ string OrderToString(ENUM_ORDER_TYPE ot)
     if (ot == OP_SELLLIMIT) return "Sell Limit";
     if (ot == OP_SELLSTOP) return "Sell Stop";
     return "";
+}
+
+// Returns true on correct time, false on incorrect time.
+bool CheckTime(string time)
+{
+    if (StringLen(time) == 7) time = "0" + time;
+
+    if (
+        // Wrong length.
+        (StringLen(time) != 8) ||
+        // Wrong separator.
+        (time[2] != ':') ||
+        // Wrong first number (only 24 hours in a day).
+        ((time[0] < '0') || (time[0] > '2')) ||
+        // 00 to 09 and 10 to 19.
+        (((time[0] == '0') || (time[0] == '1')) && ((time[1] < '0') || (time[1] > '9'))) ||
+        // 20 to 23.
+        ((time[0] == '2') && ((time[1] < '0') || (time[1] > '3'))) ||
+        // 0M to 5M.
+        ((time[3] < '0') || (time[3] > '5')) ||
+        // M0 to M9.
+        ((time[4] < '0') || (time[4] > '9')) ||
+        // Wrong second separator.
+        (time[5] != ':') ||
+        // 0S to 5S.
+        ((time[6] < '0') || (time[6] > '5')) ||
+        // S0 to S9.
+        ((time[7] < '0') || (time[7] > '9'))
+    ) return false; // Failure.
+
+    return true; // Success.
+}
+
+datetime GetOrderTimeForDailyMode(datetime current_time)
+{
+    bool skip_current_day = false;
+    datetime target_time = StringToTime(TimeToString(current_time, TIME_DATE) + " " + DailyTime); // It's important to get the target time of the appropriate day (local/server).
+    if (current_time > target_time + 10) skip_current_day = true; // Skip the current day. Give a 10 seconds buffer.
+    // Find the next enabled day:
+    for (int i = 0; i <= 7; i++, target_time += 24 * 60 * 60) // <= because the next day could be the same day of the week.
+    {
+        if ((i == 0) && (skip_current_day))
+        {
+            continue;
+        }
+        MqlDateTime target_time_struct;
+        TimeToStruct(target_time, target_time_struct);
+        if (EnabledDays[target_time_struct.day_of_week]) break;
+    }
+
+    return target_time;
 }
 //+------------------------------------------------------------------+
