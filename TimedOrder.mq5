@@ -1,11 +1,11 @@
 //+------------------------------------------------------------------+
 //|                                                      Timed Order |
-//|                                  Copyright © 2023, EarnForex.com |
+//|                                  Copyright © 2025, EarnForex.com |
 //|                                       https://www.earnforex.com/ |
 //+------------------------------------------------------------------+
-#property copyright "Copyright © 2023, EarnForex"
+#property copyright "Copyright © 2025, EarnForex"
 #property link      "https://www.earnforex.com/metatrader-expert-advisors/TimedOrder/"
-#property version   "1.01"
+#property version   "1.02"
 
 #include <Trade/Trade.mqh>
 
@@ -39,6 +39,12 @@ enum ENUM_BETTER_ORDER_TYPE
     BETTER_ORDER_TYPE_SELL_STOP_LIMIT // Sell Stop Limit
 };
 
+enum ENUM_INEQUALITY
+{
+    LESSTHAN, // <=
+    GREATERTHAN // >=
+};
+
 input group "Trading"
 input datetime OrderTime = __DATETIME__; // Date/time (server) to open order
 input ENUM_BETTER_ORDER_TYPE OrderType = BETTER_ORDER_TYPE_BUY; // Order type
@@ -59,6 +65,11 @@ input bool RetryUntilMaxSpread = false; // Retry until spread falls below MaxSpr
 input int Slippage = 30; // Maximum slippage in points
 input ENUM_TIMEFRAMES ATR_Timeframe = PERIOD_CURRENT; // ATR Timeframe
 input int ATR_Period = 14; // ATR Period
+input group "Price check"
+input bool UsePriceCheck = false;
+input string PriceSymbol = ""; // PriceSymbol: Empty = current
+input ENUM_INEQUALITY AboveOrBelow = LESSTHAN;
+input double Price = 0;
 input group "Daily mode"
 input bool DailyMode = false; // Daily mode: if true, will trade every given day.
 input string DailyTime = "18:34:00"; // Time for daily trades in HH:MM:SS format.
@@ -354,7 +365,7 @@ double GetPositionSize(double entry, double stoploss, ENUM_ORDER_TYPE dir)
     if (PositionSize < SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN)) PositionSize = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
     else if (PositionSize > SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX)) PositionSize = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
     double steps = PositionSize / SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
-    if (MathFloor(steps) < steps) PositionSize = MathFloor(steps) * SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+    if (MathAbs(MathRound(steps) - steps) > 0.00000001) PositionSize = MathFloor(steps) * SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
 
     return PositionSize;
 }
@@ -467,6 +478,40 @@ void DoTrading()
         }
         global_ticket = -1;
         return;
+    }
+
+    if (UsePriceCheck)
+    {
+        string s = Symbol();
+        if (PriceSymbol != "") s = PriceSymbol;
+        
+        string explanation = "";
+        if (AboveOrBelow == LESSTHAN)
+        {
+            if (SymbolInfoDouble(s, SYMBOL_BID) > Price) // Fail
+            {
+                explanation = s + " price " + DoubleToString(SymbolInfoDouble(s, SYMBOL_BID), (int)SymbolInfoInteger(s, SYMBOL_DIGITS)) + " > " + DoubleToString(Price, (int)SymbolInfoInteger(s, SYMBOL_DIGITS)) + ". Not opening the trade.";
+            }
+        }
+        else if (SymbolInfoDouble(s, SYMBOL_ASK) < Price) // Fail
+        {
+            explanation = s + " price " + DoubleToString(SymbolInfoDouble(s, SYMBOL_ASK), (int)SymbolInfoInteger(s, SYMBOL_DIGITS)) + " < " + DoubleToString(Price, (int)SymbolInfoInteger(s, SYMBOL_DIGITS)) + ". Not opening the trade.";
+        }
+        
+        if (explanation != "")
+        {
+            Output(explanation);
+            if (AlertsOnFailure)
+            {
+            string NativeText = OrderToString(TradeType) + ". " + explanation;
+            string Text = Symbol() + " @ " + StringSubstr(EnumToString((ENUM_TIMEFRAMES)Period()), 7) + " - " + NativeText;
+            if (EnableNativeAlerts) Alert(NativeText);
+                if (EnableEmailAlerts) SendMail("Timed Order Alert - " + Symbol() + " @ " + StringSubstr(EnumToString((ENUM_TIMEFRAMES)Period()), 7), Text);
+                if (EnablePushAlerts) SendNotification(Text);
+            }
+            global_ticket = -1;
+            return;
+        }
     }
 
     long ticket = 0;
@@ -792,7 +837,8 @@ string CheckInputParameters()
         if (FixedPositionSize < SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_MIN)) return "Position size " + DoubleToString(FixedPositionSize, CountDecimalPlaces(FixedPositionSize)) + " < minimum volume " + DoubleToString(SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_MIN), CountDecimalPlaces(SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_MIN)));
         if (FixedPositionSize > SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_MAX)) return "Position size " + DoubleToString(FixedPositionSize, CountDecimalPlaces(FixedPositionSize)) + " > maximum volume " + DoubleToString(SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_MAX), CountDecimalPlaces(SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_MAX)));
         double steps = FixedPositionSize / SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_STEP);
-        if (MathFloor(steps) < steps) return "Position size " + DoubleToString(FixedPositionSize, CountDecimalPlaces(FixedPositionSize)) + " is not a multiple of lot step " + DoubleToString(SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_STEP), CountDecimalPlaces(SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_STEP)));
+        // Using double-safe comparison.
+        if (MathAbs(MathRound(steps) - steps) > 0.00000001) return "Position size " + DoubleToString(FixedPositionSize, CountDecimalPlaces(FixedPositionSize)) + " is not a multiple of lot step " + DoubleToString(SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_STEP), CountDecimalPlaces(SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_STEP)));
     }
     else
     {
@@ -878,6 +924,18 @@ void ShowStatus()
             else if (UseEquityInsteadOfBalance) s += "Risk = " + DoubleToString(Risk, CountDecimalPlaces(Risk)) + "% of Equity (" + DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2) + " " + AccountInfoString(ACCOUNT_CURRENCY) + ")";
             else if (FixedBalance > 0) s += "Risk = " + DoubleToString(Risk, CountDecimalPlaces(Risk)) + "% of " + DoubleToString(FixedBalance, CountDecimalPlaces(AccountInfoDouble(ACCOUNT_BALANCE))) + " " + AccountInfoString(ACCOUNT_CURRENCY);
             else s += "Risk = " + DoubleToString(Risk, CountDecimalPlaces(Risk)) + "% of Balance (" + DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), CountDecimalPlaces(AccountInfoDouble(ACCOUNT_BALANCE))) + " " + AccountInfoString(ACCOUNT_CURRENCY) + ")";
+        }
+
+        if (UsePriceCheck)
+        {
+            s += "\n";
+            
+            string symbol = Symbol();
+            if (PriceSymbol != "") symbol = PriceSymbol;
+            s += symbol;
+            if (AboveOrBelow == LESSTHAN) s += " <= ";
+            else s += " >= ";
+            s += DoubleToString(Price, (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS));
         }
     }    
 

@@ -2,10 +2,8 @@
 //   Opens a trade (market or pending order) at the specified time.
 //   One-time or daily.
 //
-//   As of 2023-11-20, Stop Limit orders in cTrader don't make much sense, so they aren't implemented in this EA.
-//
-//   Version 1.01.
-//   Copyright 2023, EarnForex.com
+//   Version 1.02.
+//   Copyright 2025, EarnForex.com
 //   https://www.earnforex.com/metatrader-expert-advisors/TimedOrder/
 // -------------------------------------------------------------------------------
 
@@ -45,6 +43,12 @@ namespace cAlgo
             Server // Server time
         }
         
+        public enum ENUM_INEQUALITY
+        {
+            LessThan, // <=
+            GreaterThan // >=
+        };
+
         [Parameter("=== Trading", DefaultValue = "=================")]
         public string MainSettings { get; set; }
         
@@ -138,6 +142,22 @@ namespace cAlgo
 
         [Parameter("ATR Period", DefaultValue = 14, MinValue = 1)]
         public int ATR_Period { get; set; }
+        
+
+        [Parameter("=== Price Check", DefaultValue = "=================")]
+        public string PriceCheckInputs { get; set; }
+
+        [Parameter("Use Price Check", DefaultValue = false)]
+        public bool UsePriceCheck { get; set; }
+
+        [Parameter("Price Symbol (Empty = Current)", DefaultValue = "")]
+        public string PriceSymbol { get; set; }
+
+        [Parameter("Above or Below", DefaultValue = ENUM_INEQUALITY.LessThan)]
+        public ENUM_INEQUALITY AboveOrBelow { get; set; }
+
+        [Parameter("Check Price", DefaultValue = 0, MinValue = 0)]
+        public double Price { get; set; }
         
 
         [Parameter("=== Daily mode", DefaultValue = "=================")]
@@ -354,6 +374,42 @@ namespace cAlgo
                 return;
             }
         
+            if (UsePriceCheck)
+            {
+                string s = Symbol.Name;
+                if (PriceSymbol != "") s = PriceSymbol;
+                
+                string explanation = "";
+                Symbol symb = Symbols.GetSymbol(s);
+                if (symb == null)
+                {
+                    explanation = "Symbol not found: " + s + "!";
+                }
+                else if (AboveOrBelow == ENUM_INEQUALITY.LessThan)
+                {
+                    if (symb.Bid > Price) // Fail
+                    {
+                        explanation = s + " price " + symb.Bid.ToString() + " > " + Price.ToString() + ". Not opening the trade.";
+                    }
+                }
+                else if (symb.Ask < Price) // Fail
+                {
+                    explanation = s + " price " + symb.Ask.ToString() + " < " + Price.ToString() + ". Not opening the trade.";
+                }
+                
+                if (explanation != "")
+                {
+                    Print(explanation);
+                    if (AlertsOnFailure)
+                    {
+                        string Text = Symbol.Name + " @ " + TimeFrame.Name + " - " + OrderType.ToString() + ". " + explanation;
+                        Notifications.SendEmail(AlertEmailFrom, AlertEmailTo, "Timed Order Alert - " + Symbol.Name + " @ " + TimeFrame.Name, Text);
+                    }
+                    failure = true;
+                    return;
+                }
+            }
+
             TradeResult tr;
             ENUM_BETTER_ORDER_TYPE order_type = OrderType; // Might get updated in pending mode. Should be reflected in the alerts.
             if ((order_type == ENUM_BETTER_ORDER_TYPE.Buy) || (order_type == ENUM_BETTER_ORDER_TYPE.Sell)) // Market
@@ -595,7 +651,7 @@ namespace cAlgo
 
             double LotStep = Symbol.VolumeInUnitsStep;
             double steps = PositionSize / LotStep;
-            if (Math.Floor(steps) < steps)
+            if (Math.Abs(Math.Round(steps) - steps) > 0.00000001)
             {
                 Print("Calculated position size (" + PositionSize + ") uses uneven step size. Allowed step size = " + LotStep + ". Setting position size to " + (Math.Floor(steps) * LotStep) + ".");
                 PositionSize = Math.Floor(steps) * LotStep;
@@ -657,7 +713,7 @@ namespace cAlgo
                 if (FixedPositionSize < min_lot) return "Position size " + FixedPositionSize.ToString() + " < minimum volume " + min_lot.ToString();
                 if (FixedPositionSize > max_lot) return "Position size " + FixedPositionSize.ToString() + " > maximum volume " + max_lot.ToString();
                 double steps = FixedPositionSize / lot_step;
-                if (Math.Floor(steps) < steps) return "Position size " + FixedPositionSize.ToString() + " is not a multiple of lot step " + lot_step.ToString();
+                if (Math.Abs(Math.Round(steps) - steps) > 0.00000001) return "Position size " + FixedPositionSize.ToString() + " is not a multiple of lot step " + lot_step.ToString();
             }
             else
             {
@@ -717,8 +773,20 @@ namespace cAlgo
                     else if (FixedBalance > 0) s += "Risk = " + Risk.ToString() + "% of " + FixedBalance.ToString() + " " + Account.Asset.Name;
                     else s += "Risk = " + Risk.ToString() + "% of Balance (" + Account.Balance.ToString() + " " + Account.Asset.Name + ")";
                 }
-            }    
-        
+
+                if (UsePriceCheck)
+                {
+                    s += "\n";
+                    
+                    string symbol = Symbol.Name;
+                    if (PriceSymbol != "") symbol = PriceSymbol;
+                    s += symbol;
+                    if (AboveOrBelow == ENUM_INEQUALITY.LessThan) s += " <= ";
+                    else s += " >= ";
+                    s += Price.ToString();
+                }
+            }
+
             s += "\n";
             
             DateTime order_time = trade_time;
